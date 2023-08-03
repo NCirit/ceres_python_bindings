@@ -4,7 +4,7 @@ project(PyCeres)
 set(CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 find_package(Ceres REQUIRED)
-find_package(Glog REQUIRED)
+find_package(Glog)
 find_package(LAPACK)
 
 include_directories(${CERES_INCLUDE_DIR})
