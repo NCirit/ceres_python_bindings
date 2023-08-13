@@ -750,36 +750,31 @@ PYBIND11_MODULE(PyCeres, m) {
       [](ceres::Problem& myself,
          PyDynamicNumericDiffCostFunction* cost,
          ceres::LossFunction* loss,
-         py::array_t<double>& values) {
-        // Should we even do this error checking?
-
-        if(values.ndim() == 1)
-        {
-          double* pointer = ParseNumpyData(values);
-          return ResidualBlockIDWrapper(
-            myself.AddResidualBlock(cost->getCostFunction(), loss, pointer));
-        }
-        else if(values.ndim() == 2)
-        {
-          std::vector<double*> data;
-          int arrLen = values.shape(0);
-          for(int i = 0; i < arrLen; i++)
-          {
-            double * tmp = values.mutable_data(i);
-            data.push_back(tmp);
-          }
-          myself.AddResidualBlock(cost->getCostFunction(), loss, 
-            data.data(), arrLen);
-        }
-        else
-        {
-          throw std::runtime_error("Only 1 or 2 dimentional residual blocks supported");
-        }
-          
+          std::vector<py::array_t<double>>& values) {
+            std::vector<double*> pointer_values;
+            for (int idx = 0; idx < values.size(); ++idx) {
+                pointer_values.push_back(ParseNumpyData(values[idx]));
+            }
+            return ResidualBlockIDWrapper(
+                myself.AddResidualBlock(cost->getCostFunction(), loss, pointer_values));
       },
       py::keep_alive<1, 2>(),   // CostFunction
       py::keep_alive<1, 3>());  // LossFunction
   
+  problem.def(
+      "AddResidualBlock",
+      [](ceres::Problem& myself,
+         PyDynamicNumericDiffCostFunction* cost,
+         ceres::LossFunction* loss,
+         py::array_t<double>& values) {
+        // Should we even do this error checking?
+        double* pointer = ParseNumpyData(values);
+        return ResidualBlockIDWrapper(
+            myself.AddResidualBlock(cost->getCostFunction(), loss, pointer));
+      },
+      py::keep_alive<1, 2>(),   // CostFunction
+      py::keep_alive<1, 3>());  //
+
   problem.def(
       "AddResidualBlock",
       [](ceres::Problem& myself,
