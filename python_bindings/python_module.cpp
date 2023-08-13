@@ -29,11 +29,13 @@
 
 #include <ceres/ceres.h>
 #include <ceres/normal_prior.h>
+#include <ceres/dynamic_numeric_diff_cost_function.h>
 #include <pybind11/functional.h>
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <memory>
 #include <iostream>
 #include <string>
 
@@ -160,6 +162,122 @@ class PyCostFunction : public ceres::CostFunction {
   mutable py::str dummy;  // Dummy variable for pybind11 so it doesn't make a
   // copy
 };
+
+class PyDynamicNumericDiffCostFunction;
+
+class PyDynamicCostFunctor
+{
+
+public:
+  //typedef std::function<bool(std::vector<py::array_t<double>>&, py::array_t<double>&)> PyFunctorType;
+  typedef py::object PyFunctorType;
+  PyDynamicCostFunctor(const PyDynamicNumericDiffCostFunction* parent, 
+    const PyFunctorType& functor):
+    mParent(parent), mFunctor(functor)
+  {  }
+
+  bool operator()(double const* const* parameters, double* residuals) const;
+
+private:
+  // Vectors used to pass double pointers to python as pybind does not wrap
+  // double pointers(**) like Ceres uses.
+  // Mutable so they can be modified by the const function.
+  mutable std::vector<py::array_t<double>> parameters_vec;
+  mutable bool cached_flag = false;  // Flag used to determine if the vectors
+  // need to be resized
+  mutable py::array_t<double>
+      residuals_wrap;  // Buffer to contain the residuals
+  // pointer
+  mutable py::str dummy;  // Dummy variable for pybind11 so it doesn't make a
+  // copy
+
+  const PyDynamicNumericDiffCostFunction* mParent;
+  PyFunctorType mFunctor;
+
+};
+
+class PyDynamicNumericDiffCostFunction
+{
+  std::unique_ptr<ceres::DynamicCostFunction> mDynamicFunctor;
+  PyDynamicCostFunctor mFunctor;
+  
+public:
+  PyDynamicNumericDiffCostFunction(const py::object& functor,  
+    ceres::NumericDiffMethodType method, ceres::Ownership ownership,
+    const ceres::NumericDiffOptions& options) : mFunctor(this, functor)
+  {
+    switch(method)
+    {
+      case ceres::NumericDiffMethodType::CENTRAL:
+        mDynamicFunctor.reset(dynamic_cast<ceres::DynamicCostFunction*>(
+          new ceres::DynamicNumericDiffCostFunction<PyDynamicCostFunctor, ceres::NumericDiffMethodType::CENTRAL>(&mFunctor, ownership, options)));
+        break;
+      case ceres::NumericDiffMethodType::FORWARD:
+        mDynamicFunctor.reset(dynamic_cast<ceres::DynamicCostFunction*>(
+          new ceres::DynamicNumericDiffCostFunction<PyDynamicCostFunctor, ceres::NumericDiffMethodType::FORWARD>(&mFunctor, ownership, options)));
+        break;
+      case ceres::NumericDiffMethodType::RIDDERS:
+        mDynamicFunctor.reset(dynamic_cast<ceres::DynamicCostFunction*>(
+          new ceres::DynamicNumericDiffCostFunction<PyDynamicCostFunctor, ceres::NumericDiffMethodType::RIDDERS>(&mFunctor, ownership, options)));
+        break;
+      default:
+        mDynamicFunctor.reset(dynamic_cast<ceres::DynamicCostFunction*>(
+          new ceres::DynamicNumericDiffCostFunction<PyDynamicCostFunctor, ceres::NumericDiffMethodType::CENTRAL>(&mFunctor, ownership, options)));
+        break;
+    }
+  }
+
+
+  void add_parameter_block(int size)
+  {
+    mDynamicFunctor->AddParameterBlock(size);
+  }
+
+  void set_num_residuals(int num)
+  {
+  	mDynamicFunctor->SetNumResiduals(num);
+  }
+
+  ceres::DynamicCostFunction* getCostFunction() const
+  {
+    return mDynamicFunctor.get();
+  }
+};
+
+
+bool PyDynamicCostFunctor::operator()(double const* const* parameters, 
+  double* residuals) const 
+{
+  pybind11::gil_scoped_acquire gil;
+
+  auto costFunction = this->mParent->getCostFunction();
+  // Resize the vectors passed to python to the proper size. And set the
+  // pointer values
+  if (!cached_flag) {
+    parameters_vec.reserve(costFunction->parameter_block_sizes().size());
+    residuals_wrap = py::array_t<double>(costFunction->num_residuals(), residuals, dummy);
+    for (size_t idx = 0; idx < costFunction->parameter_block_sizes().size(); ++idx) {
+      parameters_vec.emplace_back(py::array_t<double>(
+          costFunction->parameter_block_sizes()[idx], parameters[idx], dummy));
+    }
+    cached_flag = true;
+  }
+
+  // Check if the pointers have changed and if they have then change them
+  auto info = residuals_wrap.request(true);
+  if (info.ptr != residuals) {
+    residuals_wrap = py::array_t<double>(costFunction->num_residuals(), residuals, dummy);
+  }
+  info = parameters_vec[0].request(true);
+  if (info.ptr != parameters) {
+    for (size_t idx = 0; idx < parameters_vec.size(); ++idx) {
+      parameters_vec[idx] = py::array_t<double>(
+          costFunction->parameter_block_sizes()[idx], parameters[idx], dummy);
+    }
+  }
+
+  return py::bool_(mFunctor(parameters_vec, residuals_wrap));
+}
 
 // Trampoline class so that we can create a LossFunction in Python.
 class PyLossFunction : public ceres::LossFunction {
@@ -396,6 +514,12 @@ PYBIND11_MODULE(PyCeres, m) {
       .value("DO_NOT_TAKE_OWNERSHIP", ceres::Ownership::DO_NOT_TAKE_OWNERSHIP)
       .value("TAKE_OWNERSHIP", ceres::Ownership::TAKE_OWNERSHIP)
       .export_values();
+    
+  py::enum_<ceres::NumericDiffMethodType>(m, "NumericDiffMethodType")
+      .value("CENTRAL", ceres::NumericDiffMethodType::CENTRAL)
+      .value("FORWARD", ceres::NumericDiffMethodType::FORWARD)
+      .value("RIDDERS", ceres::NumericDiffMethodType::RIDDERS)
+      .export_values();
 
   py::enum_<ceres::MinimizerType>(m, "MinimizerType")
       .value("LINE_SEARCH", ceres::MinimizerType::LINE_SEARCH)
@@ -531,6 +655,20 @@ PYBIND11_MODULE(PyCeres, m) {
 
   py::class_<ResidualBlockIDWrapper> residual_block_wrapper(m, "ResidualBlock");
 
+  py::class_<PyDynamicNumericDiffCostFunction> dynamicNumericDiffCostFunction(m, "DynamicNumericDiffCostFunction");
+
+  dynamicNumericDiffCostFunction.def(
+    py::init<const PyDynamicCostFunctor::PyFunctorType&, 
+      ceres::NumericDiffMethodType, 
+      ceres::Ownership, 
+      const ceres::NumericDiffOptions&>());
+  
+  dynamicNumericDiffCostFunction.def("add_parameter_block",
+    &PyDynamicNumericDiffCostFunction::add_parameter_block);
+  
+  dynamicNumericDiffCostFunction.def("set_num_residuals",
+    &PyDynamicNumericDiffCostFunction::set_num_residuals);
+
   py::class_<ceres::Problem> problem(m, "Problem");
   problem.def(py::init(&CreatePythonProblem));
   problem.def(py::init<ceres::Problem::Options>());
@@ -607,6 +745,41 @@ PYBIND11_MODULE(PyCeres, m) {
                 py::buffer_info info = np_arr.request();
                 return myself.HasParameterBlock((double*)info.ptr);
               });
+  problem.def(
+      "AddResidualBlock",
+      [](ceres::Problem& myself,
+         PyDynamicNumericDiffCostFunction* cost,
+         ceres::LossFunction* loss,
+         py::array_t<double>& values) {
+        // Should we even do this error checking?
+
+        if(values.ndim() == 1)
+        {
+          double* pointer = ParseNumpyData(values);
+          return ResidualBlockIDWrapper(
+            myself.AddResidualBlock(cost->getCostFunction(), loss, pointer));
+        }
+        else if(values.ndim() == 2)
+        {
+          std::vector<double*> data;
+          int arrLen = values.shape(0);
+          for(int i = 0; i < arrLen; i++)
+          {
+            double * tmp = values.mutable_data(i);
+            data.push_back(tmp);
+          }
+          myself.AddResidualBlock(cost->getCostFunction(), loss, 
+            data.data(), arrLen);
+        }
+        else
+        {
+          throw std::runtime_error("Only 1 or 2 dimentional residual blocks supported");
+        }
+          
+      },
+      py::keep_alive<1, 2>(),   // CostFunction
+      py::keep_alive<1, 3>());  // LossFunction
+  
   problem.def(
       "AddResidualBlock",
       [](ceres::Problem& myself,
